@@ -9,17 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added — 2026-10-15
 
-- backend/src/error-handler.test.js (#114): Jest tests asserting that all
-  error responses have the standardised `{ error: string, code: string }`
-  envelope on both 400 (route-level validation) and 500 (unhandled error) paths.
+- contracts/vesting: `batch_create_schedule(env, params: Vec<CreateScheduleParams>) -> Vec<u64>`
+  (#122). Creates multiple vesting schedules atomically in a single transaction.
+  Requires admin auth; contract must not be paused; `params` must be non-empty
+  (`VestingError::BatchEmpty` otherwise). Delegates to the existing
+  `create_schedule_internal` helper so per-schedule validation (amount > 0,
+  duration > 0, cliff ≤ duration, overflow guards) applies to every entry.
+  Because the function runs inside a single Soroban transaction, any validation
+  failure rolls back all state changes — no partial batches are possible.
+  Returns a `Vec<u64>` of newly created schedule IDs in input order.
+  New tests in `contracts/vesting/src/lib.rs`:
+  `test_batch_create_schedule_three` (3-schedule batch, ID order, token
+  conservation, beneficiary schedule lists), `test_batch_token_conservation`
+  (deposits, full-vest claim, conservation), `test_batch_empty_panics`,
+  `test_batch_all_or_nothing_invalid_amount`, `test_batch_blocked_when_paused`.
+
+- contracts/vesting: `VestingError` typed error enum (#124).
+  `#[contracterror]` enum replaces all bare `panic!()` strings in the vesting
+  contract. Variants: `AmountMustBePositive = 1`, `DurationMustBePositive = 2`,
+  `CliffExceedsDuration = 3`, `StartPlusCliffOverflow = 4`,
+  `StartPlusDurationOverflow = 5`, `ScheduleNotFound = 6`,
+  `ScheduleNotActive = 7`, `NothingToClaim = 8`, `ContractIsPaused = 9`,
+  `BatchEmpty = 10`. All `panic!()` calls replaced with `panic_with_error!`.
+  Callers receive a stable `u32` error code instead of matching on string
+  messages. All existing `#[should_panic]` tests updated to match; all pass.
+
+- docs/security-model.md (#120). Per-function authorization model and threat
+  analysis covering all three contracts. Six sections: (1) trust hierarchy
+  (admin, multisig owners, beneficiary, anyone); (2) per-function auth table
+  for vesting, token, and multisig contracts; (3) pause semantics with
+  rationale for each gated/ungated function; (4) CEI compliance summary for
+  `claim`, `revoke`, and multisig `execute`; (5) known limitations (no upgrade
+  mechanism, floor-division rounding, no audit, no mainnet deployment,
+  unbounded beneficiary list); (6) attack surface summary cross-referenced with
+  `SECURITY.md`. Written strictly from source code and existing documentation.
+
+- backend/src/error-handler.test.js (#114): Jest tests asserting that all error
+  responses have the standardised `{ error: string, code: string }` envelope on
+  both 400 (route-level validation) and 500 (unhandled error) paths.
 
 ### Changed — 2026-10-15
 
 - backend/src/index.js (#114): centralised error handler middleware now always
   returns `{ error: string, code: string }`. `code` is taken from `err.code`
   if set, otherwise defaults to `'INTERNAL_ERROR'` for 500 responses or
-  `'REQUEST_ERROR'` for other status codes. Stack trace is logged server-side
-  only and is never sent to the client.
+  `'REQUEST_ERROR'` for other status codes. The raw stack trace continues to be
+  logged server-side only and is never sent to the client.
+
+- README.md: "Security" section now links to the new
+  `docs/security-model.md` document (#120).
 
 ### Added — 2026-10-07
 

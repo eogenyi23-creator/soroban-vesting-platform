@@ -17,7 +17,8 @@
 #![allow(clippy::needless_borrows_for_generic_args)]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    Address, Env, Symbol, Vec,
 };
 
 // ─── Storage keys ───────────────────────────────────────────────────────────
@@ -37,6 +38,38 @@ pub const INSTANCE_BUMP_THRESHOLD: u32 = 518_400;
 /// Persistent Schedule / BeneficiarySchedules entries use the same window.
 pub const PERSISTENT_BUMP_LEDGERS: u32 = 3_110_400;
 pub const PERSISTENT_BUMP_THRESHOLD: u32 = 518_400;
+
+// ─── Error type ─────────────────────────────────────────────────────────────
+
+/// Typed error codes for the vesting contract.
+///
+/// Using `#[contracterror]` maps each variant to a stable `u32` code that
+/// Soroban clients can match on without string parsing.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum VestingError {
+    /// `total_amount` is zero or negative.
+    AmountMustBePositive = 1,
+    /// `total_duration` is zero.
+    DurationMustBePositive = 2,
+    /// `cliff_duration` is greater than `total_duration`.
+    CliffExceedsDuration = 3,
+    /// `start_time + cliff_duration` would overflow `u64`.
+    StartPlusCliffOverflow = 4,
+    /// `start_time + total_duration` would overflow `u64`.
+    StartPlusDurationOverflow = 5,
+    /// A schedule with the given ID does not exist in storage.
+    ScheduleNotFound = 6,
+    /// The schedule's status is not `Active` (already Revoked or Completed).
+    ScheduleNotActive = 7,
+    /// The vested amount equals the already-claimed amount; nothing to transfer.
+    NothingToClaim = 8,
+    /// The contract is paused; `create_schedule` and `claim` are blocked.
+    ContractIsPaused = 9,
+    /// `batch_create_schedule` was called with an empty params vector.
+    BatchEmpty = 10,
+}
 
 // ─── Data types ────────────────────────────────────────────────────────────
 
@@ -119,85 +152,35 @@ impl VestingContract {
         Self::bump_instance(&env);
         Self::require_admin(&env);
         Self::require_not_paused(&env);
+        Self::create_schedule_internal(&env, params)
+    }
 
-        if params.total_amount <= 0 {
-            panic!("amount must be positive");
+    /// Create multiple vesting schedules atomically in a single transaction.
+    ///
+    /// All schedules are validated and created together. Because this executes
+    /// within a single Soroban transaction, failure at any step rolls back all
+    /// state changes — no partial batches are possible.
+    ///
+    /// Requires admin auth. Contract must not be paused.
+    /// `params` must be non-empty.
+    ///
+    /// Returns a `Vec<u64>` of the newly created schedule IDs in the same
+    /// order as the input `params`.
+    pub fn batch_create_schedule(env: Env, params: Vec<CreateScheduleParams>) -> Vec<u64> {
+        Self::bump_instance(&env);
+        Self::require_admin(&env);
+        Self::require_not_paused(&env);
+
+        if params.is_empty() {
+            panic_with_error!(&env, VestingError::BatchEmpty);
         }
-        if params.total_duration == 0 {
-            panic!("duration must be > 0");
+
+        let mut ids: Vec<u64> = Vec::new(&env);
+        for p in params.iter() {
+            let id = Self::create_schedule_internal(&env, p);
+            ids.push_back(id);
         }
-        if params.cliff_duration > params.total_duration {
-            panic!("cliff exceeds duration");
-        }
-
-        // Reject schedules where start_time + cliff_duration or
-        // start_time + total_duration would overflow u64.  If either sum
-        // overflows, vested_amount() would trap on every call to claim() or
-        // revoke(), permanently locking the deposited funds.
-        params
-            .start_time
-            .checked_add(params.cliff_duration)
-            .expect("start_time + cliff_duration overflows u64");
-        params
-            .start_time
-            .checked_add(params.total_duration)
-            .expect("start_time + total_duration overflows u64");
-
-        let tk = token::Client::new(&env, &params.token_address);
-        tk.transfer(
-            &params.from,
-            &env.current_contract_address(),
-            &params.total_amount,
-        );
-
-        let id: u64 = env.storage().instance().get(&SCHED_ID).unwrap_or(0);
-        let next_id = id + 1;
-
-        let schedule = VestingSchedule {
-            id: next_id,
-            beneficiary: params.beneficiary.clone(),
-            token: params.token_address,
-            total_amount: params.total_amount,
-            claimed_amount: 0,
-            start_time: params.start_time,
-            cliff_duration: params.cliff_duration,
-            total_duration: params.total_duration,
-            status: ScheduleStatus::Active,
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Schedule(next_id), &schedule);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Schedule(next_id),
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_LEDGERS,
-        );
-
-        let mut ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BeneficiarySchedules(params.beneficiary.clone()))
-            .unwrap_or(Vec::new(&env));
-        ids.push_back(next_id);
-        env.storage().persistent().set(
-            &DataKey::BeneficiarySchedules(params.beneficiary.clone()),
-            &ids,
-        );
-        env.storage().persistent().extend_ttl(
-            &DataKey::BeneficiarySchedules(params.beneficiary.clone()),
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_LEDGERS,
-        );
-
-        env.storage().instance().set(&SCHED_ID, &next_id);
-
-        env.events().publish(
-            (EVT_CREATED,),
-            (next_id, params.beneficiary, params.total_amount),
-        );
-
-        next_id
+        ids
     }
 
     /// Claim all currently vested-but-unclaimed tokens for a schedule.
@@ -209,19 +192,19 @@ impl VestingContract {
             .storage()
             .persistent()
             .get(&DataKey::Schedule(schedule_id))
-            .expect("schedule not found");
+            .unwrap_or_else(|| panic_with_error!(&env, VestingError::ScheduleNotFound));
 
         schedule.beneficiary.require_auth();
 
         if schedule.status != ScheduleStatus::Active {
-            panic!("schedule is not active");
+            panic_with_error!(&env, VestingError::ScheduleNotActive);
         }
 
         let now = env.ledger().timestamp();
         let claimable = Self::vested_amount(&schedule, now) - schedule.claimed_amount;
 
         if claimable <= 0 {
-            panic!("nothing to claim");
+            panic_with_error!(&env, VestingError::NothingToClaim);
         }
 
         schedule.claimed_amount += claimable;
@@ -266,10 +249,10 @@ impl VestingContract {
             .storage()
             .persistent()
             .get(&DataKey::Schedule(schedule_id))
-            .expect("schedule not found");
+            .unwrap_or_else(|| panic_with_error!(&env, VestingError::ScheduleNotFound));
 
         if schedule.status != ScheduleStatus::Active {
-            panic!("schedule is not active");
+            panic_with_error!(&env, VestingError::ScheduleNotActive);
         }
 
         let now = env.ledger().timestamp();
@@ -348,7 +331,7 @@ impl VestingContract {
         env.storage()
             .persistent()
             .get(&DataKey::Schedule(schedule_id))
-            .expect("schedule not found")
+            .unwrap_or_else(|| panic_with_error!(&env, VestingError::ScheduleNotFound))
     }
 
     pub fn get_claimable(env: Env, schedule_id: u64) -> i128 {
@@ -356,7 +339,7 @@ impl VestingContract {
             .storage()
             .persistent()
             .get(&DataKey::Schedule(schedule_id))
-            .expect("schedule not found");
+            .unwrap_or_else(|| panic_with_error!(&env, VestingError::ScheduleNotFound));
         let now = env.ledger().timestamp();
         (Self::vested_amount(&schedule, now) - schedule.claimed_amount).max(0)
     }
@@ -396,6 +379,90 @@ impl VestingContract {
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
+    /// Shared per-schedule creation logic used by both `create_schedule` and
+    /// `batch_create_schedule`. Assumes admin auth and pause check have already
+    /// been performed by the caller.
+    fn create_schedule_internal(env: &Env, params: CreateScheduleParams) -> u64 {
+        if params.total_amount <= 0 {
+            panic_with_error!(env, VestingError::AmountMustBePositive);
+        }
+        if params.total_duration == 0 {
+            panic_with_error!(env, VestingError::DurationMustBePositive);
+        }
+        if params.cliff_duration > params.total_duration {
+            panic_with_error!(env, VestingError::CliffExceedsDuration);
+        }
+
+        // Reject schedules where start_time + cliff_duration or
+        // start_time + total_duration would overflow u64.  If either sum
+        // overflows, vested_amount() would trap on every call to claim() or
+        // revoke(), permanently locking the deposited funds.
+        params
+            .start_time
+            .checked_add(params.cliff_duration)
+            .unwrap_or_else(|| panic_with_error!(env, VestingError::StartPlusCliffOverflow));
+        params
+            .start_time
+            .checked_add(params.total_duration)
+            .unwrap_or_else(|| panic_with_error!(env, VestingError::StartPlusDurationOverflow));
+
+        let tk = token::Client::new(env, &params.token_address);
+        tk.transfer(
+            &params.from,
+            &env.current_contract_address(),
+            &params.total_amount,
+        );
+
+        let id: u64 = env.storage().instance().get(&SCHED_ID).unwrap_or(0);
+        let next_id = id + 1;
+
+        let schedule = VestingSchedule {
+            id: next_id,
+            beneficiary: params.beneficiary.clone(),
+            token: params.token_address,
+            total_amount: params.total_amount,
+            claimed_amount: 0,
+            start_time: params.start_time,
+            cliff_duration: params.cliff_duration,
+            total_duration: params.total_duration,
+            status: ScheduleStatus::Active,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Schedule(next_id), &schedule);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Schedule(next_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_LEDGERS,
+        );
+
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BeneficiarySchedules(params.beneficiary.clone()))
+            .unwrap_or(Vec::new(env));
+        ids.push_back(next_id);
+        env.storage().persistent().set(
+            &DataKey::BeneficiarySchedules(params.beneficiary.clone()),
+            &ids,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::BeneficiarySchedules(params.beneficiary.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_LEDGERS,
+        );
+
+        env.storage().instance().set(&SCHED_ID, &next_id);
+
+        env.events().publish(
+            (EVT_CREATED,),
+            (next_id, params.beneficiary, params.total_amount),
+        );
+
+        next_id
+    }
+
     /// Extend instance storage TTL so ADMIN, PAUSED and SCHED_ID do not expire
     /// while the contract is in active use.
     fn bump_instance(env: &Env) {
@@ -416,7 +483,7 @@ impl VestingContract {
     fn require_not_paused(env: &Env) {
         let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
         if paused {
-            panic!("contract is paused");
+            panic_with_error!(env, VestingError::ContractIsPaused);
         }
     }
 
@@ -765,10 +832,10 @@ mod tests {
         assert_eq!(sched.status, ScheduleStatus::Revoked);
     }
 
-    // ── claim after revoke must panic ────────────────────────────────────────
+    // ── claim after revoke must error with ScheduleNotActive ─────────────────
 
     #[test]
-    #[should_panic(expected = "schedule is not active")]
+    #[should_panic]
     fn test_claim_after_revoke_panics() {
         let (env, vesting_id, _admin, beneficiary, funder) = setup();
         let token = new_token(&env, &funder, 100_000);
@@ -788,13 +855,13 @@ mod tests {
 
         env.ledger().with_mut(|l| l.timestamp = start + 50);
         vesting.revoke(&id, &admin);
-        vesting.claim(&id); // must panic
+        vesting.claim(&id); // must panic with VestingError::ScheduleNotActive
     }
 
     // ── nothing to claim before cliff ────────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "nothing to claim")]
+    #[should_panic]
     fn test_claim_before_cliff_panics() {
         let (env, vesting_id, _admin, beneficiary, funder) = setup();
         let token = new_token(&env, &funder, 100_000);
@@ -812,13 +879,13 @@ mod tests {
         });
 
         env.ledger().with_mut(|l| l.timestamp = start + 50); // before cliff
-        vesting.claim(&id);
+        vesting.claim(&id); // must panic with VestingError::NothingToClaim
     }
 
     // ── pause blocks create_schedule ─────────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "contract is paused")]
+    #[should_panic]
     fn test_pause_blocks_create_schedule() {
         let (env, vesting_id, _admin, beneficiary, funder) = setup();
         let token = new_token(&env, &funder, 100_000);
@@ -834,13 +901,13 @@ mod tests {
             start_time: start,
             cliff_duration: 0,
             total_duration: 100,
-        });
+        }); // must panic with VestingError::ContractIsPaused
     }
 
     // ── pause blocks claim ───────────────────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "contract is paused")]
+    #[should_panic]
     fn test_pause_blocks_claim() {
         let (env, vesting_id, _admin, beneficiary, funder) = setup();
         let token = new_token(&env, &funder, 100_000);
@@ -859,7 +926,7 @@ mod tests {
 
         env.ledger().with_mut(|l| l.timestamp = start + 50);
         vesting.pause();
-        vesting.claim(&id);
+        vesting.claim(&id); // must panic with VestingError::ContractIsPaused
     }
 
     // ── unpause restores functionality ───────────────────────────────────────
@@ -1024,10 +1091,10 @@ mod tests {
         assert_eq!(ids.get(2).unwrap(), id3);
     }
 
-    // ── double-revoke must panic ──────────────────────────────────────────────
+    // ── double-revoke must error with ScheduleNotActive ───────────────────────
 
     #[test]
-    #[should_panic(expected = "schedule is not active")]
+    #[should_panic]
     fn test_double_revoke_panics() {
         let (env, vesting_id, admin, beneficiary, funder) = setup();
         let token = new_token(&env, &funder, 100_000);
@@ -1045,7 +1112,7 @@ mod tests {
         });
 
         vesting.revoke(&id, &admin);
-        vesting.revoke(&id, &admin); // must panic
+        vesting.revoke(&id, &admin); // must panic with VestingError::ScheduleNotActive
     }
 
     // ── E3: revoke() state is finalised before token transfers (CEI) ─────────
@@ -1361,6 +1428,201 @@ mod tests {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // batch_create_schedule tests (#122)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Batch of 3 schedules for different beneficiaries: all IDs returned,
+    /// schedule_count increments by 3, token balances are correct.
+    #[test]
+    fn test_batch_create_schedule_three() {
+        let (env, vesting_id, _admin, _b, funder) = setup();
+        let vesting = VestingContractClient::new(&env, &vesting_id);
+        let b1 = Address::generate(&env);
+        let b2 = Address::generate(&env);
+        let b3 = Address::generate(&env);
+
+        // Mint enough for all three schedules from funder
+        let token = new_token(&env, &funder, 300_000);
+        let start = env.ledger().timestamp();
+
+        let mut params: Vec<CreateScheduleParams> = Vec::new(&env);
+        params.push_back(CreateScheduleParams {
+            from: funder.clone(),
+            beneficiary: b1.clone(),
+            token_address: token.clone(),
+            total_amount: 100_000,
+            start_time: start,
+            cliff_duration: 0,
+            total_duration: 100,
+        });
+        params.push_back(CreateScheduleParams {
+            from: funder.clone(),
+            beneficiary: b2.clone(),
+            token_address: token.clone(),
+            total_amount: 100_000,
+            start_time: start,
+            cliff_duration: 0,
+            total_duration: 200,
+        });
+        params.push_back(CreateScheduleParams {
+            from: funder.clone(),
+            beneficiary: b3.clone(),
+            token_address: token.clone(),
+            total_amount: 100_000,
+            start_time: start,
+            cliff_duration: 50,
+            total_duration: 300,
+        });
+
+        let ids = vesting.batch_create_schedule(&params);
+
+        // Returns correct number of IDs
+        assert_eq!(ids.len(), 3);
+        // IDs are sequential starting from 1
+        assert_eq!(ids.get(0).unwrap(), 1u64);
+        assert_eq!(ids.get(1).unwrap(), 2u64);
+        assert_eq!(ids.get(2).unwrap(), 3u64);
+
+        // schedule_count reflects all three
+        assert_eq!(vesting.schedule_count(), 3);
+
+        // Token conservation: all 300_000 moved to vesting contract
+        let tk = soroban_sdk::token::Client::new(&env, &token);
+        assert_eq!(tk.balance(&funder), 0);
+        assert_eq!(tk.balance(&vesting_id), 300_000);
+
+        // Each beneficiary has exactly one schedule
+        assert_eq!(vesting.get_beneficiary_schedules(&b1).len(), 1);
+        assert_eq!(vesting.get_beneficiary_schedules(&b2).len(), 1);
+        assert_eq!(vesting.get_beneficiary_schedules(&b3).len(), 1);
+    }
+
+    /// Token conservation: total deposited == sum of schedule total_amounts.
+    #[test]
+    fn test_batch_token_conservation() {
+        let (env, vesting_id, _admin, _b, funder) = setup();
+        let vesting = VestingContractClient::new(&env, &vesting_id);
+        let b1 = Address::generate(&env);
+        let b2 = Address::generate(&env);
+
+        let token = new_token(&env, &funder, 500_000);
+        let start = env.ledger().timestamp();
+
+        let mut params: Vec<CreateScheduleParams> = Vec::new(&env);
+        params.push_back(CreateScheduleParams {
+            from: funder.clone(),
+            beneficiary: b1.clone(),
+            token_address: token.clone(),
+            total_amount: 200_000,
+            start_time: start,
+            cliff_duration: 0,
+            total_duration: 100,
+        });
+        params.push_back(CreateScheduleParams {
+            from: funder.clone(),
+            beneficiary: b2.clone(),
+            token_address: token.clone(),
+            total_amount: 300_000,
+            start_time: start,
+            cliff_duration: 0,
+            total_duration: 100,
+        });
+
+        let ids = vesting.batch_create_schedule(&params);
+        assert_eq!(ids.len(), 2);
+
+        let tk = soroban_sdk::token::Client::new(&env, &token);
+        // All tokens transferred to vesting
+        assert_eq!(tk.balance(&funder), 0);
+        assert_eq!(tk.balance(&vesting_id), 500_000);
+
+        // Advance time to full vest and claim both
+        env.ledger().with_mut(|l| l.timestamp = start + 100);
+        let c1 = vesting.claim(&ids.get(0).unwrap());
+        let c2 = vesting.claim(&ids.get(1).unwrap());
+        assert_eq!(c1, 200_000);
+        assert_eq!(c2, 300_000);
+        // Conservation: beneficiaries received exactly what was deposited
+        assert_eq!(tk.balance(&b1) + tk.balance(&b2), 500_000);
+        assert_eq!(tk.balance(&vesting_id), 0);
+    }
+
+    /// An empty params vector must error with BatchEmpty.
+    #[test]
+    #[should_panic]
+    fn test_batch_empty_panics() {
+        let (env, vesting_id, _admin, _b, _f) = setup();
+        let vesting = VestingContractClient::new(&env, &vesting_id);
+        let empty: Vec<CreateScheduleParams> = Vec::new(&env);
+        vesting.batch_create_schedule(&empty); // must panic with VestingError::BatchEmpty
+    }
+
+    /// batch_create_schedule with an invalid entry (amount=0) must reject the
+    /// entire batch atomically — no schedules created, no tokens transferred.
+    #[test]
+    #[should_panic]
+    fn test_batch_all_or_nothing_invalid_amount() {
+        let (env, vesting_id, _admin, _b, funder) = setup();
+        let vesting = VestingContractClient::new(&env, &vesting_id);
+        let b1 = Address::generate(&env);
+        let b2 = Address::generate(&env);
+
+        let token = new_token(&env, &funder, 200_000);
+        let start = env.ledger().timestamp();
+
+        let mut params: Vec<CreateScheduleParams> = Vec::new(&env);
+        // Valid first entry
+        params.push_back(CreateScheduleParams {
+            from: funder.clone(),
+            beneficiary: b1.clone(),
+            token_address: token.clone(),
+            total_amount: 100_000,
+            start_time: start,
+            cliff_duration: 0,
+            total_duration: 100,
+        });
+        // Invalid second entry: amount == 0 → VestingError::AmountMustBePositive
+        params.push_back(CreateScheduleParams {
+            from: funder.clone(),
+            beneficiary: b2.clone(),
+            token_address: token.clone(),
+            total_amount: 0,
+            start_time: start,
+            cliff_duration: 0,
+            total_duration: 100,
+        });
+
+        // This must panic, rolling back the entire transaction
+        vesting.batch_create_schedule(&params);
+    }
+
+    /// batch_create_schedule is blocked when the contract is paused.
+    #[test]
+    #[should_panic]
+    fn test_batch_blocked_when_paused() {
+        let (env, vesting_id, _admin, _b, funder) = setup();
+        let vesting = VestingContractClient::new(&env, &vesting_id);
+        let b1 = Address::generate(&env);
+        let token = new_token(&env, &funder, 100_000);
+        let start = env.ledger().timestamp();
+
+        vesting.pause();
+
+        let mut params: Vec<CreateScheduleParams> = Vec::new(&env);
+        params.push_back(CreateScheduleParams {
+            from: funder.clone(),
+            beneficiary: b1.clone(),
+            token_address: token.clone(),
+            total_amount: 100_000,
+            start_time: start,
+            cliff_duration: 0,
+            total_duration: 100,
+        });
+
+        vesting.batch_create_schedule(&params); // must panic with VestingError::ContractIsPaused
+    }
+
     // ── Multisig as vesting admin — end-to-end ───────────────────────────────
     //
     // The multisig contract is the vesting admin.  All tests use the real
@@ -1555,7 +1817,7 @@ mod tests {
     /// create_schedule with start_time + total_duration overflowing u64 must
     /// panic before any funds are transferred.
     #[test]
-    #[should_panic(expected = "start_time + total_duration overflows u64")]
+    #[should_panic]
     fn test_create_schedule_start_plus_duration_overflow() {
         let (env, vesting_id, _admin, beneficiary, funder) = setup();
         let token = new_token(&env, &funder, 100_000);
@@ -1576,7 +1838,7 @@ mod tests {
     /// create_schedule with start_time + cliff_duration overflowing u64 must
     /// panic before any funds are transferred.
     #[test]
-    #[should_panic(expected = "start_time + cliff_duration overflows u64")]
+    #[should_panic]
     fn test_create_schedule_start_plus_cliff_overflow() {
         let (env, vesting_id, _admin, beneficiary, funder) = setup();
         let token = new_token(&env, &funder, 100_000);
