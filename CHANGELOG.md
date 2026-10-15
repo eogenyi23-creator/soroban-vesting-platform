@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — 2026-10-15
+
+- backend/src/error-handler.test.js (#114): Jest tests asserting that all
+  error responses have the standardised `{ error: string, code: string }`
+  envelope on both 400 (route-level validation) and 500 (unhandled error) paths.
+
+### Changed — 2026-10-15
+
+- backend/src/index.js (#114): centralised error handler middleware now always
+  returns `{ error: string, code: string }`. `code` is taken from `err.code`
+  if set, otherwise defaults to `'INTERNAL_ERROR'` for 500 responses or
+  `'REQUEST_ERROR'` for other status codes. Stack trace is logged server-side
+  only and is never sent to the client.
+
 ### Added — 2026-10-07
 
 - Testnet deployment: token contract `CBFVQMSOIMRWLZGKY4MMBASEJLKBLGBIYWT76MH47M5B2ODRDT264KKH` and
