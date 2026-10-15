@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — 2026-10-15
+
+- docs/security-model.md (#120). Per-function authorization model and threat
+  analysis covering all three contracts. Six sections: (1) trust hierarchy
+  (admin, multisig owners, beneficiary, anyone); (2) per-function auth table
+  for vesting, token, and multisig contracts; (3) pause semantics with
+  rationale for each gated/ungated function; (4) CEI compliance summary for
+  `claim`, `revoke`, and multisig `execute`; (5) known limitations (no upgrade
+  mechanism, floor-division rounding, no audit, no mainnet deployment,
+  unbounded beneficiary list); (6) attack surface summary cross-referenced with
+  `SECURITY.md`. Written strictly from source code and existing documentation.
+
+### Changed — 2026-10-15
+
+- README.md: "Security" section now links to the new
+  `docs/security-model.md` document (#120).
+
 ### Added — 2026-10-07
 
 - Testnet deployment: token contract `CBFVQMSOIMRWLZGKY4MMBASEJLKBLGBIYWT76MH47M5B2ODRDT264KKH` and

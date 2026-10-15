@@ -431,6 +431,10 @@ can be developed independently of a live deployment.
 See [SECURITY.md](SECURITY.md) for the vulnerability disclosure policy and
 security architecture notes.
 
+For a detailed per-function authorization model, trust hierarchy, CEI
+compliance summary, and attack surface analysis see
+[docs/security-model.md](docs/security-model.md).
+
 ---
 
 ## License
